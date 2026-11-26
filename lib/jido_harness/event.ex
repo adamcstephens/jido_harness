@@ -40,6 +40,7 @@ defmodule Jido.Harness.Event do
     :turn_failed,
     :turn_interrupted,
     :approval_requested,
+    :elicitation_requested,
     :approval_resolved,
     :queue_changed,
     :provider_event

@@ -45,6 +45,7 @@ defmodule Jido.Harness.SessionAdapters.ACPTransport do
        pending_prompt_result: nil,
        handler_flush_timer: nil,
        approvals: %{},
+       elicitations: %{},
        # the transport bridge, when the agent advertised ACP steering
        steering: nil,
        closing?: false
@@ -112,7 +113,7 @@ defmodule Jido.Harness.SessionAdapters.ACPTransport do
 
   def handle_call({:interrupt, requested}, _from, %{active_turn_id: turn_id} = state)
       when requested in [:active, turn_id] and not is_nil(turn_id) do
-    state = state |> deny_pending_approvals() |> cancel_prompt_wait()
+    state = state |> deny_pending_approvals() |> cancel_elicitations() |> cancel_prompt_wait()
     :ok = Client.cancel(state.client, state.provider_session_id)
     stop_prompt_task(state.prompt_task)
     {:reply, :ok, %{state | active_turn_id: nil, prompt_task: nil}}
@@ -131,6 +132,30 @@ defmodule Jido.Harness.SessionAdapters.ACPTransport do
     end
   end
 
+  def handle_call(:elicitation_turn, _from, state),
+    do: {:reply, state.active_turn_id, state}
+
+  def handle_call({:respond_elicitation, request_id, response}, _from, state) do
+    case Map.get(state.elicitations, request_id) do
+      nil ->
+        {:reply, {:error, :unknown_request}, state}
+
+      pending ->
+        if Process.alive?(pending.worker) do
+          case elicitation_response(response) do
+            {:ok, response} ->
+              send(pending.worker, {:jido_harness_elicitation_response, pending.ref, response})
+              {:reply, :ok, remove_elicitation(state, request_id, pending)}
+
+            {:error, reason} ->
+              {:reply, {:error, reason}, state}
+          end
+        else
+          {:reply, {:error, :unknown_request}, remove_elicitation(state, request_id, pending)}
+        end
+    end
+  end
+
   def handle_call({:configure, changes}, _from, state) do
     changes = configuration_changes(changes, state.context.adapter)
 
@@ -141,7 +166,7 @@ defmodule Jido.Harness.SessionAdapters.ACPTransport do
   end
 
   def handle_call(:close, _from, state) do
-    state = %{state | closing?: true} |> deny_pending_approvals() |> cancel_prompt_wait()
+    state = %{state | closing?: true} |> deny_pending_approvals() |> cancel_elicitations() |> cancel_prompt_wait()
     stop_prompt_task(state.prompt_task)
     stop_client(state.client, state.provider_session_id)
     {:stop, :normal, :ok, %{state | client: nil, prompt_task: nil, active_turn_id: nil}}
@@ -223,6 +248,23 @@ defmodule Jido.Harness.SessionAdapters.ACPTransport do
      }}
   end
 
+  def handle_info({:acp_form_elicitation, worker, ref, turn_id, params}, state) do
+    if state.request.form_elicitation and
+         Map.get(params, "sessionId") == state.provider_session_id and
+         not is_nil(turn_id) and turn_id == state.active_turn_id and Process.alive?(worker) and
+         not state.closing? do
+      request_id = ID.generate("request")
+      monitor = Process.monitor(worker)
+      pending = %{worker: worker, ref: ref, monitor: monitor}
+
+      emit(state, :elicitation_requested, params, request_id: request_id, turn_id: state.active_turn_id)
+      {:noreply, %{state | elicitations: Map.put(state.elicitations, request_id, pending)}}
+    else
+      send(worker, {:jido_harness_elicitation_response, ref, %{"action" => "cancel"}})
+      {:noreply, state}
+    end
+  end
+
   def handle_info({:acp_steer_result, from, {:ok, %{"outcome" => "startedNewTurn"}}}, state) do
     # The agent ignored promptRequired. Its new turn has no Harness identity
     # or prompt task, so stop the transport and fail the session.
@@ -285,8 +327,13 @@ defmodule Jido.Harness.SessionAdapters.ACPTransport do
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{prompt_task: %{ref: ref}, active_turn_id: turn_id} = state) do
     emit(state, :turn_failed, %{"error" => "ACP prompt worker exited: #{inspect(reason)}"}, turn_id: turn_id)
-    state = cancel_prompt_wait(state)
+    state = state |> cancel_elicitations() |> cancel_prompt_wait()
     {:noreply, %{state | prompt_task: nil, active_turn_id: nil}}
+  end
+
+  def handle_info({:DOWN, monitor, :process, _pid, _reason}, state) do
+    elicitations = Map.reject(state.elicitations, fn {_id, pending} -> pending.monitor == monitor end)
+    {:noreply, %{state | elicitations: elicitations}}
   end
 
   def handle_info({:EXIT, client, reason}, %{client: client, closing?: false} = state) when is_pid(client),
@@ -297,7 +344,7 @@ defmodule Jido.Harness.SessionAdapters.ACPTransport do
 
   @impl true
   def terminate(_reason, state) do
-    state = state |> deny_pending_approvals() |> cancel_prompt_wait()
+    state = state |> deny_pending_approvals() |> cancel_elicitations() |> cancel_prompt_wait()
     stop_prompt_task(state.prompt_task)
 
     if state.initialize_from do
@@ -328,10 +375,11 @@ defmodule Jido.Harness.SessionAdapters.ACPTransport do
         "title" => "Jido Harness",
         "version" => Jido.Harness.version()
       },
-      capabilities: %{
-        "fs" => %{"readTextFile" => false, "writeTextFile" => false},
-        "terminal" => false
-      },
+      capabilities:
+        Map.merge(
+          %{"fs" => %{"readTextFile" => false, "writeTextFile" => false}, "terminal" => false},
+          if(state.request.form_elicitation, do: %{"elicitation" => %{"form" => %{}}}, else: %{})
+        ),
       event_listener: self(),
       protocol_version: 1,
       max_frame_bytes: ArborACPTransport.max_frame_bytes(),
@@ -457,7 +505,7 @@ defmodule Jido.Harness.SessionAdapters.ACPTransport do
   defp finish_prompt(state, turn_id, {:ok, result}) do
     type = if result["stopReason"] == "cancelled", do: :turn_interrupted, else: :turn_completed
     emit(state, type, %{"stop_reason" => result["stopReason"]}, turn_id: turn_id)
-    deny_pending_approvals(state)
+    state |> deny_pending_approvals() |> cancel_elicitations()
   end
 
   defp finish_prompt(state, turn_id, {:error, reason}) do
@@ -470,7 +518,7 @@ defmodule Jido.Harness.SessionAdapters.ACPTransport do
         else: payload
 
     emit(state, :turn_failed, payload, turn_id: turn_id)
-    deny_pending_approvals(state)
+    state |> deny_pending_approvals() |> cancel_elicitations()
   end
 
   defp queue_or_finish_prompt(state, turn_id, result) do
@@ -666,6 +714,55 @@ defmodule Jido.Harness.SessionAdapters.ACPTransport do
 
     %{state | approvals: %{}}
   end
+
+  defp cancel_elicitations(state) do
+    Enum.each(state.elicitations, fn {_id, pending} ->
+      Process.demonitor(pending.monitor, [:flush])
+      send(pending.worker, {:jido_harness_elicitation_response, pending.ref, %{"action" => "cancel"}})
+    end)
+
+    %{state | elicitations: %{}}
+  end
+
+  defp remove_elicitation(state, request_id, pending) do
+    Process.demonitor(pending.monitor, [:flush])
+    %{state | elicitations: Map.delete(state.elicitations, request_id)}
+  end
+
+  defp elicitation_response(action) when action in [:accept, :decline, :cancel],
+    do: {:ok, %{"action" => Atom.to_string(action)}}
+
+  defp elicitation_response(response) when is_map(response) do
+    action = Map.get(response, :action, Map.get(response, "action"))
+    content = Map.get(response, :content, Map.get(response, "content"))
+    content? = Map.has_key?(response, :content) or Map.has_key?(response, "content")
+
+    cond do
+      Enum.any?(Map.keys(response), &(&1 not in [:action, :content, "action", "content"])) ->
+        invalid_elicitation_response()
+
+      action in [:accept, "accept"] and (is_nil(content) or (is_map(content) and json_value?(content))) ->
+        result = %{"action" => "accept"}
+        {:ok, if(content?, do: Map.put(result, "content", content), else: result)}
+
+      action in [:decline, :cancel, "decline", "cancel"] and not content? ->
+        {:ok, %{"action" => to_string(action)}}
+
+      true ->
+        invalid_elicitation_response()
+    end
+  end
+
+  defp elicitation_response(_response), do: invalid_elicitation_response()
+
+  defp invalid_elicitation_response,
+    do: {:error, Error.validation("elicitation response must accept optional JSON object content, decline, or cancel")}
+
+  defp json_value?(value) when is_map(value),
+    do: Enum.all?(value, fn {key, item} -> is_binary(key) and json_value?(item) end)
+
+  defp json_value?(value) when is_list(value), do: Enum.all?(value, &json_value?/1)
+  defp json_value?(value), do: is_nil(value) or is_boolean(value) or is_number(value) or is_binary(value)
 
   defp process_spec(request, context) do
     acp_agent = context.acp_agent

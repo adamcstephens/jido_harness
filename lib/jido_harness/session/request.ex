@@ -23,6 +23,7 @@ defmodule Jido.Harness.SessionRequest do
     :metadata,
     :provider_options,
     :acp_path,
+    :form_elicitation,
     :turn_runtime_timeout_ms,
     :turn_idle_timeout_ms,
     :session_idle_timeout_ms,
@@ -56,6 +57,7 @@ defmodule Jido.Harness.SessionRequest do
               metadata: Zoi.map(Zoi.union([Zoi.string(), Zoi.atom()]), Zoi.any()) |> Zoi.default(%{}),
               provider_options: Zoi.map(Zoi.union([Zoi.string(), Zoi.atom()]), Zoi.any()) |> Zoi.default(%{}),
               acp_path: Zoi.string() |> Zoi.nullish(),
+              form_elicitation: Zoi.boolean() |> Zoi.default(false),
               turn_runtime_timeout_ms: Zoi.union([Zoi.integer(), Zoi.literal(:infinity)]) |> Zoi.default(:infinity),
               turn_idle_timeout_ms: Zoi.union([Zoi.integer(), Zoi.literal(:infinity)]) |> Zoi.default(:infinity),
               session_idle_timeout_ms: Zoi.union([Zoi.integer(), Zoi.literal(:infinity)]) |> Zoi.default(:infinity),
@@ -132,6 +134,9 @@ defmodule Jido.Harness.SessionRequest do
     ]
 
     cond do
+      not is_boolean(Map.get(attrs, :form_elicitation, false)) ->
+        {:error, Jido.Harness.Error.validation("form_elicitation must be a boolean")}
+
       field =
           Enum.find(
             [:max_queued_turns, :max_queued_bytes, :max_retained_turns, :max_result_bytes, :max_pending_approvals],

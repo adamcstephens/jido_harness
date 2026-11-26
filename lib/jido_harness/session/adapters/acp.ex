@@ -61,6 +61,9 @@ defmodule Jido.Harness.SessionAdapters.ACP do
   def respond_approval(handle, request_id, response),
     do: Jido.Harness.SessionAdapter.call(handle, {:respond_approval, {request_id, response}})
 
+  def respond_elicitation(handle, request_id, response),
+    do: Jido.Harness.SessionAdapter.call(handle, {:respond_elicitation, request_id, response})
+
   @impl true
   def configure(handle, changes),
     do: Jido.Harness.SessionAdapter.call(handle, {:configure, changes})

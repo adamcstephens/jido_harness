@@ -15,6 +15,7 @@ pending_prompt = None
 pending_steer = None
 authenticated = False
 configured_mode = None
+initialize_params = None
 
 
 def send(value, fragmented=False):
@@ -106,6 +107,7 @@ for line in sys.stdin:
 
     if method == "initialize":
         time.sleep(float(os.environ.get("HARNESS_FIXTURE_INITIALIZE_DELAY", "0")))
+        initialize_params = message.get("params", {})
         auth_method = os.environ.get("HARNESS_FIXTURE_REQUIRE_AUTH_METHOD")
         auth_methods = []
         if auth_method:
@@ -184,6 +186,24 @@ for line in sys.stdin:
             for block in message.get("params", {}).get("prompt", [])
             if isinstance(block, dict)
         )
+        if text == "echo-client-capabilities":
+            complete_prompt(request_id, text=json.dumps(initialize_params))
+            continue
+        if text == "request form":
+            pending_prompt = request_id
+            params = {
+                "sessionId": session_id,
+                "mode": "form",
+                "message": "Choose a deployment target",
+                "requestedSchema": json.loads(os.environ["HARNESS_FIXTURE_FORM_SCHEMA"]),
+            }
+            send({
+                "jsonrpc": "2.0",
+                "id": 100,
+                "method": "elicitation/create",
+                "params": params,
+            })
+            continue
         if text.strip() == "echo-attachment-links":
             links = [block for block in message["params"]["prompt"] if block["type"] == "resource_link"]
             complete_prompt(request_id, text=json.dumps(links))
@@ -275,6 +295,16 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": request_id, "result": {}})
         params = message.get("params", {})
         model = params.get("modelId") or (params.get("value") if params.get("configId") == "model" else None)
+        if model == "exit-with-pending-form":
+            sys.exit(1)
+        if model == "cancel-pending-form":
+            send({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": 100}})
+        if model == "update-pending-form":
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": session_id,
+                "update": {"sessionUpdate": "tool_call", "toolCallId": "form-tool",
+                           "title": "Choose a deployment target", "status": "in_progress"},
+            }})
         if os.environ.get("HARNESS_FIXTURE_IDLE_PERMISSION") == "1" and model == "background-approval":
             request_permission()
         if pending_steer is not None and model == "start-untracked-turn":
@@ -303,6 +333,9 @@ for line in sys.stdin:
             pending_prompt = None
     elif method == "session/close":
         send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif request_id == 100 and pending_prompt is not None:
+        complete_prompt(pending_prompt, text=json.dumps(message))
+        pending_prompt = None
     elif request_id == 99 and pending_prompt is not None:
         outcome = message.get("result", {}).get("outcome", {})
         selected = outcome.get("optionId", "")

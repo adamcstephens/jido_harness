@@ -251,6 +251,13 @@ defmodule Jido.Harness.SessionWorker do
     end
   end
 
+  def handle_call({:respond_elicitation, _request_id, _response}, _from, %{status: status} = state)
+      when status in [:closed, :failed, :cancelled],
+      do: {:reply, {:error, :unknown_request}, state}
+
+  def handle_call({:respond_elicitation, request_id, response}, _from, state),
+    do: {:reply, ACP.respond_elicitation(state.handle, request_id, response), state}
+
   def handle_call({:configure, changes}, _from, state) when is_map(changes) do
     with {:ok, changes} <- RequestValidator.normalize_configuration(changes),
          {:ok, request} <- RequestValidator.validate_configuration(state, changes),

@@ -1,6 +1,16 @@
 defmodule Jido.Harness.ACPSessionTest do
   use ExUnit.Case, async: false
 
+  defmodule NonACPAdapter do
+    @behaviour Jido.Harness.Adapter
+
+    @impl Jido.Harness.Adapter
+    def spec, do: %{Jido.Harness.TestAdapter.spec() | acp_agent: nil}
+
+    @impl Jido.Harness.Adapter
+    defdelegate status(config), to: Jido.Harness.TestAdapter
+  end
+
   setup do
     providers = Application.get_env(:jido_harness, :providers)
     config = Application.get_env(:jido_harness, :provider_config)
@@ -483,6 +493,190 @@ defmodule Jido.Harness.ACPSessionTest do
 
     assert {:error, %Jido.Harness.Error{details: %{field: :reasoning_effort}}} =
              Jido.Harness.Session.send_message(session_id, %{prompt: "hello", reasoning_effort: :high})
+  end
+
+  test "non-ACP providers cannot opt in to form elicitation" do
+    Application.put_env(:jido_harness, :providers, %{test: NonACPAdapter})
+
+    assert {:error, %Jido.Harness.Error{message: "provider does not expose an ACP agent"}} =
+             Jido.Harness.Session.start(:test, %{form_elicitation: true})
+  end
+
+  test "ACP advertises only opt-in form elicitation without URL support" do
+    for enabled <- [nil, false, true] do
+      opts = if is_nil(enabled), do: %{}, else: %{form_elicitation: enabled}
+      assert {:ok, session_id} = Jido.Harness.Session.start(:kimi, opts)
+
+      assert {:ok, _info} = await_ready(session_id)
+
+      assert {:ok, turn_id} =
+               Jido.Harness.Session.send_message(session_id, "echo-client-capabilities")
+
+      assert {:ok, %{text: text}} =
+               Jido.Harness.Session.await(session_id, turn_id, 2_000)
+
+      capabilities = Jason.decode!(text)["clientCapabilities"]
+      assert get_in(capabilities, ["elicitation", "form"]) == if(enabled, do: %{}, else: nil)
+      refute get_in(capabilities, ["elicitation", "url"])
+      assert :ok = Jido.Harness.Session.close(session_id)
+    end
+  end
+
+  test "ACP rejects form requests when host form support was not enabled" do
+    assert {:ok, session_id} =
+             Jido.Harness.Session.start(:kimi, %{
+               env: %{"HARNESS_FIXTURE_FORM_SCHEMA" => Jason.encode!(form_schema())}
+             })
+
+    assert {:ok, _info} = await_ready(session_id)
+    assert {:ok, turn_id} = Jido.Harness.Session.send_message(session_id, "request form")
+
+    assert {:ok, %{status: :completed, text: text}} =
+             Jido.Harness.Session.await(session_id, turn_id, 2_000)
+
+    assert %{"id" => 100, "error" => %{"code" => -32601}} = Jason.decode!(text)
+    assert {:ok, events} = Jido.Harness.Session.replay(session_id)
+    refute Enum.any?(events, &(&1.type == :elicitation_requested))
+  end
+
+  test "ACP forms preserve schemas and return accepted, declined and cancelled answers in the same turn" do
+    for response <- [
+          %{"action" => "accept", "content" => %{"target" => "staging", "other" => "preview"}},
+          %{"action" => "accept"},
+          %{"action" => "accept", "content" => nil},
+          %{"action" => "decline"},
+          %{"action" => "cancel"}
+        ] do
+      assert {:ok, session_id} = start_form_session()
+      assert {:ok, _info} = await_ready(session_id)
+      assert {:ok, turn_id} = Jido.Harness.Session.send_message(session_id, "request form")
+      event = await_elicitation(session_id)
+      assert event.turn_id == turn_id
+      assert event.payload["message"] == "Choose a deployment target"
+      assert event.payload["requestedSchema"] == form_schema()
+      refute Map.has_key?(event.payload, "toolCallId")
+      assert {:ok, events} = Jido.Harness.Session.replay(session_id)
+      refute Enum.any?(events, &(&1.type == :tool_call))
+
+      assert :ok = Jido.Harness.Session.configure(session_id, %{model: "update-pending-form"})
+
+      assert eventually(fn ->
+               {:ok, events} = Jido.Harness.Session.replay(session_id)
+
+               Enum.any?(events, fn update ->
+                 update.type == :tool_call and update.turn_id == turn_id and update.sequence > event.sequence
+               end)
+             end)
+
+      assert :ok =
+               Jido.Harness.Session.respond_elicitation(session_id, event.request_id, response)
+
+      assert {:error, :unknown_request} =
+               Jido.Harness.Session.respond_elicitation(session_id, event.request_id, response)
+
+      assert {:ok, %{status: :completed, text: text}} =
+               Jido.Harness.Session.await(session_id, turn_id, 2_000)
+
+      assert %{"id" => 100, "result" => ^response} = Jason.decode!(text)
+      assert :ok = Jido.Harness.Session.close(session_id)
+    end
+  end
+
+  test "ACP form responses belong to the originating session and expire on interruption" do
+    assert {:ok, session_id} = start_form_session()
+    assert {:ok, other_id} = start_form_session()
+    assert {:ok, _info} = await_ready(session_id)
+    assert {:ok, _info} = await_ready(other_id)
+    assert {:ok, turn_id} = Jido.Harness.Session.send_message(session_id, "request form")
+    event = await_elicitation(session_id)
+
+    assert {:error, :unknown_request} =
+             Jido.Harness.Session.respond_elicitation(other_id, event.request_id, %{"action" => "cancel"})
+
+    assert :ok = Jido.Harness.Session.interrupt(session_id)
+    assert {:ok, %{status: :interrupted}} = Jido.Harness.Session.await(session_id, turn_id, 2_000)
+
+    assert {:error, :unknown_request} =
+             Jido.Harness.Session.respond_elicitation(session_id, event.request_id, %{"action" => "accept"})
+
+    assert {:ok, next_id} = Jido.Harness.Session.send_message(session_id, "continue")
+    assert {:ok, %{status: :completed}} = Jido.Harness.Session.await(session_id, next_id, 2_000)
+  end
+
+  test "closing ACP clears an unanswered form" do
+    assert {:ok, session_id} = start_form_session()
+    assert {:ok, _info} = await_ready(session_id)
+    assert {:ok, _turn_id} = Jido.Harness.Session.send_message(session_id, "request form")
+    event = await_elicitation(session_id)
+    assert :ok = Jido.Harness.Session.close(session_id)
+
+    assert {:error, :unknown_request} =
+             Jido.Harness.Session.respond_elicitation(session_id, event.request_id, %{"action" => "cancel"})
+  end
+
+  @tag :capture_log
+  test "ACP transport loss invalidates an unanswered form" do
+    assert {:ok, session_id} = start_form_session()
+    assert {:ok, _info} = await_ready(session_id)
+    assert {:ok, _turn_id} = Jido.Harness.Session.send_message(session_id, "request form")
+    event = await_elicitation(session_id)
+    assert :ok = Jido.Harness.Session.configure(session_id, %{model: "exit-with-pending-form"})
+    assert {:ok, %{state: :failed}} = await_state(session_id, :failed)
+
+    assert {:error, :unknown_request} =
+             Jido.Harness.Session.respond_elicitation(session_id, event.request_id, %{"action" => "cancel"})
+  end
+
+  test "agent cancellation invalidates the form before the turn ends" do
+    assert {:ok, session_id} = start_form_session()
+    assert {:ok, _info} = await_ready(session_id)
+    assert {:ok, turn_id} = Jido.Harness.Session.send_message(session_id, "request form")
+    event = await_elicitation(session_id)
+    assert :ok = Jido.Harness.Session.configure(session_id, %{model: "cancel-pending-form"})
+
+    assert {:ok, %{status: :completed, text: text}} =
+             Jido.Harness.Session.await(session_id, turn_id, 2_000)
+
+    assert %{"id" => 100, "error" => %{"code" => -32800}} = Jason.decode!(text)
+
+    assert {:error, :unknown_request} =
+             Jido.Harness.Session.respond_elicitation(session_id, event.request_id, %{"action" => "accept"})
+  end
+
+  defp start_form_session do
+    Jido.Harness.Session.start(:claude, %{
+      form_elicitation: true,
+      env: %{"HARNESS_FIXTURE_FORM_SCHEMA" => Jason.encode!(form_schema())}
+    })
+  end
+
+  defp form_schema do
+    %{
+      "type" => "object",
+      "properties" => %{
+        "target" => %{
+          "type" => "string",
+          "title" => "Deployment target",
+          "oneOf" => [
+            %{"const" => "staging", "title" => "Staging environment"},
+            %{"const" => "production", "title" => "Production environment"}
+          ],
+          "default" => "staging"
+        },
+        "other" => %{"type" => "string", "title" => "Other"}
+      },
+      "required" => ["target"]
+    }
+  end
+
+  defp await_elicitation(session_id) do
+    assert eventually(fn ->
+             {:ok, events} = Jido.Harness.Session.replay(session_id)
+             Enum.any?(events, &(&1.type == :elicitation_requested))
+           end)
+
+    {:ok, events} = Jido.Harness.Session.replay(session_id)
+    Enum.find(events, &(&1.type == :elicitation_requested))
   end
 
   defp await_ready(session_id, attempts \\ 100)

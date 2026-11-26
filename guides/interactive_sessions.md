@@ -204,6 +204,43 @@ For application approval rules, see the tested
 [policy job recipe](recipes/policy_jobs.md). Set a finite approval timeout so
 an unanswered permission request cannot wait without a limit.
 
+## Answer structured ACP questions
+
+Set `form_elicitation: true` in the options passed to `Session.start/2` to
+advertise ACP form support. It is off by default and unsupported on non-ACP
+transports. This advertises what your application can handle, not what the
+agent can request. The capability is negotiated once per ACP connection;
+sessions sharing a connection cannot independently change it. URL
+elicitation is not supported.
+
+Listen for `:elicitation_requested` on the session's event stream and use the
+request ID with `Session.respond_elicitation/3` to answer in the same turn.
+The event carries the agent's message and requested schema. Do not wait for
+a tool-call event: the form can arrive first and need not name a tool call.
+
+For an elicitation event from `Session.stream/2`, submit an answer with:
+
+```elixir
+:ok =
+  Jido.Harness.Session.respond_elicitation(session_id, event.request_id, %{
+    action: :accept,
+    content: %{"strategy" => "balanced"}
+  })
+```
+
+Use `:decline` or `:cancel` instead of the action map for those choices.
+An accept may omit `content` or set it to `nil`.
+
+Identify the requesting agent, display its message, and let users review and
+edit their answers before submitting. Provide explicit decline and cancel
+controls. Validate supplied content against `event.payload["requestedSchema"]`
+before responding. Forms are for non-sensitive data; do not use them to
+collect secrets or credentials.
+
+Each request can be answered once, on the originating session. Interrupting
+the turn, closing the session, or losing the ACP connection invalidates
+unanswered requests.
+
 ## Close, kill, and prune
 
 ```elixir

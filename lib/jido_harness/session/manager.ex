@@ -91,6 +91,8 @@ defmodule Jido.Harness.SessionManager do
   def interrupt(id, turn_id), do: call(id, {:interrupt, turn_id})
   @doc "Forwards an application decision for a pending approval request."
   def respond_approval(id, request_id, response), do: call(id, {:respond_approval, request_id, response})
+  @doc "Forwards a response to a pending native ACP form elicitation."
+  def respond_elicitation(id, request_id, response), do: call(id, {:respond_elicitation, request_id, response})
   @doc "Forwards provider configuration changes to the session worker."
   def configure(id, changes), do: call(id, {:configure, changes})
   @doc "Requests graceful session closure."
@@ -141,6 +143,7 @@ defmodule Jido.Harness.SessionManager do
     :metadata,
     :provider_options,
     :acp_path,
+    :form_elicitation,
     :turn_runtime_timeout_ms,
     :turn_idle_timeout_ms,
     :session_idle_timeout_ms,

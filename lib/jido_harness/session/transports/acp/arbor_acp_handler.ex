@@ -34,4 +34,21 @@ defmodule Jido.Harness.SessionAdapters.ACP.ArborACPHandler do
       {:jido_harness_approval_response, ^ref, outcome} -> {:ok, outcome, state}
     end
   end
+
+  @impl Arbor.ACP.Client.Handler
+  def handle_form_elicitation(params, state) do
+    transport = state.transport
+    turn_id = GenServer.call(transport, :elicitation_turn)
+
+    work = fn ->
+      ref = make_ref()
+      send(transport, {:acp_form_elicitation, self(), ref, turn_id, params})
+
+      receive do
+        {:jido_harness_elicitation_response, ^ref, response} -> {:ok, response}
+      end
+    end
+
+    {:async, work, state}
+  end
 end

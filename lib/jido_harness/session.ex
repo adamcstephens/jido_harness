@@ -96,6 +96,17 @@ defmodule Jido.Harness.Session do
   def respond_approval(session_id, request_id, response),
     do: SessionManager.respond_approval(session_id, request_id, response)
 
+  @doc """
+  Responds to a pending native ACP form elicitation.
+
+  Accepts `:accept`, `:decline`, `:cancel`, or a map with `action` and optional
+  `content`. Accepted content must be a JSON object or nil. The caller is
+  responsible for validating supplied content against the event's
+  `requestedSchema` before accepting.
+  """
+  def respond_elicitation(session_id, request_id, response),
+    do: SessionManager.respond_elicitation(session_id, request_id, response)
+
   @doc "Changes supported runtime session configuration."
   @spec configure(String.t(), map()) :: :ok | {:error, term()}
   def configure(session_id, changes), do: SessionManager.configure(session_id, changes)
